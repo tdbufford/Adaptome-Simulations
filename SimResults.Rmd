@@ -1,0 +1,461 @@
+---
+title: "Bayesian Platform Clinical Trial Simulations"
+date: "Feb 2022"
+output: pdf_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(janitor)
+library(kableExtra)
+library(gridExtra)
+library(ggpubr)
+library(dplyr)
+library(R2jags)
+library(stringr)
+library(coda)
+library(MASS)
+library(ebal)
+```
+
+Mean increase of 0.1 for each Adaptation
+
+Superiority Threshold: 0.9
+
+Futility Threshold: 0.1
+
+N per Interim: 300
+
+Outcome Design 1: Y = X1 + X2 + X3 - X4 + X5 + X6 + eta
+
+Outcome Design 2: Y = X1 + X2 + 0.2 * X3 * X4 - sqrt(X5) + eta
+
+Number of platform trials: 500
+
+
+```{r}
+directory = "C:/Simulation Results/"
+
+
+# number of individuals per arm per interim analysis
+NperInterim = c(300)
+
+# model used for interim analyses
+models = c("EB weights", "EB weights + Covariates", "Neither")
+modelNames = c("EntropyBalancing", "EB_Covariates", "Neither")
+
+# names of trials
+orderNames = c("IncreasingEffects", "RandomEffects")
+
+# different outcome designs (linear and non-linear combos of covariates)
+outcomeDesign = c(1, 2)
+
+# superiority threshold
+sup = 0.9
+# futility threshold
+fut = 0.1
+
+# create matrix to store counts
+counts = array(NA, dim = c(24, length(models), 
+                           length(orderNames), length(outcomeDesign)))
+
+```
+
+&nbsp;
+&nbsp;
+
+The following graphs show the bias (estimated mean outcome - true mean outcome)
+
+
+```{r load data and calculate summary counts, warning=FALSE, message=FALSE}
+
+
+for(j in 1:length(models)){
+  # model used in interim analyses
+  model = models[j]
+  modelName = modelNames[j]
+  
+  for(k in 1:length(orderNames)){
+    # name of trial (increasing or random order of adaptations)
+    orderName = orderNames[k]
+    
+    for(l in 1:length(outcomeDesign)){
+      # outcome design 
+      outcome = outcomeDesign[l]
+      
+      # file name based on parameters
+      file = 
+        paste("platformTrialSummary_", modelName, "_", orderName,
+              "_Outcome", outcome , ".csv", sep = "")
+      
+      # average total sample size per trial
+      #file name
+      file2 = 
+        paste("totalSampleSizes_",  modelName, "_", orderName,
+              "_Outcome", outcome , ".csv", sep = "")
+        
+        assign("summary",
+               as.data.frame(read.csv(
+                 paste(directory, file, sep = ""),
+                 header = TRUE,
+                 check.names = TRUE
+               )))
+        
+        assign("sampsize", 
+               read.csv(paste(directory,file2, sep=""), ))
+      
+     
+      max_tx_mean = 0.8
+      if(model == "Entropy Balancing" | model == "Neither"){
+        if(outcome == 1){max_tx_mean = round(max_tx_mean + 1.5, 1)
+        }else if(outcome == 2){max_tx_mean = round(max_tx_mean - 0.8)
+        }
+      }
+      max2_tx_mean = round(max_tx_mean - 0.1, 1)
+      
+      # number of trials run
+      counts[1, j, k, l] = max(summary$Trial.Number)
+      
+      # get average of total sample sizes for platform trials
+      counts[2, j, k, l] = round(mean(sampsize$sampleSize), 0)
+      
+      # get median of total sample sizes for platform trials
+      counts[3, j, k, l] = round(median(sampsize$sampleSize), 0)
+      
+       # average number of analyses in a trial
+      round((summary %>% 
+        group_by(Trial.Number) %>%
+        summarise(num_analyses = max(Interim.Analysis)) %>%
+        summarise(mean(num_analyses)))[[1]], 1) -> counts[4, j, k, l]
+      
+      # median number of analyses in a trial
+      round((summary %>% 
+        group_by(Trial.Number) %>%
+        summarise(num_analyses = max(Interim.Analysis)) %>%
+        summarise(median(num_analyses)))[[1]], 1) -> counts[5, j, k, l]
+      
+      # number of trials that get to adaptation with highest mean
+      (summary %>%
+        filter(True.Value == max_tx_mean) %>%
+        distinct(Trial.Number) %>%
+        ungroup() %>%
+        summarise(n()))[[1]] -> counts[6, j, k, l]
+      
+      # number of trials that successfully identify best adaptation 
+      # and it get's switched to reference group
+      # OR where success prob > 0.9 at last analysis
+      (summary %>%
+        group_by(Trial.Number) %>%
+        filter(Interim.Analysis == max(Interim.Analysis)) %>%
+        filter(True.Value == max_tx_mean & 
+                 (Reference.Group.Flag == 1 | Superiority.Criteria.Met == 1)) %>%
+        distinct(Trial.Number) %>%
+        ungroup() %>%
+        summarise(n()))[[1]] -> counts[7, j, k, l]
+      
+      # proportion that identify best adaptation
+      counts[8, j, k, l] = 
+        round(counts[7, j, k, l]/counts[1, j, k, l]*100, 1)
+      
+      # number of trials that successfully identify best OR SECOND BEST adaptation 
+      # and it get's switched to reference group
+      # OR where success prob > 0.95 at last analysis
+      (summary %>%
+        group_by(Trial.Number) %>%
+        filter(Interim.Analysis == max(Interim.Analysis)) %>%
+        filter((True.Value == max_tx_mean | True.Value == max2_tx_mean) & 
+                 (Reference.Group.Flag == 1 | Superiority.Criteria.Met == 1)) %>%
+        distinct(Trial.Number) %>%
+        ungroup() %>%
+        summarise(n()))[[1]] -> counts[9, j, k, l]
+   
+      #proportion of trials that identify best or next best adaptation
+      counts[10, j, k, l] = 
+        round(counts[9, j, k, l]/counts[1, j, k, l]*100, 1)
+      
+      # get reference group information for each analysis
+      summary %>% 
+        filter(Reference.Group.Flag == 1) %>%
+        dplyr::select(Trial.Number, Interim.Analysis, Estimate,
+               True.Value) %>%
+        rename("RefGroupEstimate" = Estimate,
+               "RefGroupTrueProb" = True.Value) -> one_row_per_analysis
+      
+      # total number of interim analyses
+      counts[11, j, k, l] = nrow(one_row_per_analysis)
+      
+      
+      # get adaptations that met superiority threshold for each analysis
+      summary %>% 
+        group_by(Trial.Number, Interim.Analysis) %>%
+        filter(Superiority.Criteria.Met == 1) %>%
+        filter(Estimate == max(Estimate)) %>%
+        #filter(n()>1)
+        filter(Intervention.Number == min(Intervention.Number)) %>%
+        ungroup() %>%
+        dplyr::select(Trial.Number, Interim.Analysis, Estimate, 
+               True.Value, Superiority.Prob) %>%
+        rename("NewAdaptEstimate" = Estimate,
+               "NewAdaptTrueProb" = True.Value) %>%
+        right_join(one_row_per_analysis, 
+                   by = c("Trial.Number", "Interim.Analysis")) ->
+        one_row_per_analysis
+      
+      #total number of reference group switches made
+      (one_row_per_analysis %>%
+        filter(!is.na(NewAdaptEstimate)) %>%
+        summarise(n()))[[1]] -> counts[12, j, k, l]
+      
+      # how many times two adaptations simultaneously meet superiority criteria
+      (summary %>%
+        group_by(Trial.Number, Interim.Analysis) %>%
+        filter(sum(Superiority.Criteria.Met, na.rm = TRUE) > 1) %>%
+        distinct(Interim.Analysis) %>%
+        ungroup() %>%
+        summarise(n()))[[1]] -> counts[13, j, k, l]
+      
+      # how many times two adaptations simultaneously meet superiority criteria
+      # and one with lower true success probability is chosen
+      (summary %>%
+        group_by(Trial.Number, Interim.Analysis) %>%
+        filter(Superiority.Criteria.Met == 1) %>%
+        filter(sum(Superiority.Criteria.Met, na.rm = TRUE) > 1) %>%
+        dplyr::select(Trial.Number, Interim.Analysis, True.Value,
+               Estimate, Superiority.Prob) %>%
+        filter(Estimate == max(Estimate) & 
+                 True.Value != max(True.Value)) %>%
+        distinct(Interim.Analysis) %>%
+        ungroup() %>%
+        summarise(n()))[[1]] -> counts[14, j, k, l]
+      
+  
+      # number of ref group switches where new ref had lower true success
+      (one_row_per_analysis %>% 
+        filter(NewAdaptTrueProb <= RefGroupTrueProb) %>%
+        summarise(n()))[[1]] -> counts[15, j, k, l]
+   
+      # proportion of suboptimal ref group switches 
+      counts[16, j, k, l] = round((counts[15, j, k, l]) / 
+                                 counts[12, j, k, l]*100, 1)
+      
+      # total number of times any adaptation dropped for futility
+      (summary %>%
+        filter(Inferiority.Criteria.Met == 1) %>%
+        summarise(n()))[[1]] -> counts[17, j, k, l]
+      
+      # number of times best adaptation dropped for futility
+      (summary %>%
+        filter(Inferiority.Criteria.Met == 1 & True.Value == max_tx_mean) %>%
+        summarise(n()))[[1]] -> counts[18, j, k, l]
+      
+      #number of times more than one adaptation dropped at once
+      (summary %>% 
+        group_by(Trial.Number, Interim.Analysis) %>%
+        filter(Inferiority.Criteria.Met == 1) %>%
+        filter(n()>1) %>%
+        distinct(Interim.Analysis) %>%
+        ungroup() %>%
+        summarise(n()))[[1]] -> counts[19, j, k, l]
+  
+      # number of times adaptation with higher true success probability than reference
+      # group dropped for futility
+      summary %>% 
+        group_by(Trial.Number, Interim.Analysis) %>%
+        filter(Inferiority.Criteria.Met == 1) %>%
+        ungroup() %>%
+        dplyr::select(Trial.Number, Interim.Analysis, Estimate,
+               True.Value, Superiority.Prob) %>%
+        rename("FutilAdaptEstimate" = Estimate,
+               "FutilAdaptTrueProb" = True.Value) %>%
+        right_join(one_row_per_analysis, 
+                   by = c("Trial.Number", "Interim.Analysis")) -> 
+        one_row_per_drop
+      
+      (one_row_per_drop %>%
+        filter(FutilAdaptTrueProb > RefGroupTrueProb) %>%
+        summarise(n()))[[1]] -> counts[20, j, k, l]
+      
+      #proportion drops suboptimal
+      counts[21, j, k, l] = 
+        round(counts[20, j, k, l]/counts[17, j, k, l]*100, 1)
+  
+      # calculate probability of good action
+      #   weights each ACTION equally, some trials may have more actions than others
+  
+      # total number of actions is sum of drops and reference group switches
+      #num_actions = num_switches + num_drops
+      num_actions = counts[12, j, k, l] + counts[17, j, k, l]
+      counts[22, j, k, l] = num_actions
+      
+      
+      # number of "good" switches (success prob of new is higher than old reference)
+      #num_good_switches = num_switches - num_suboptimal_switches
+       num_good_switches = counts[12, j, k, l] - counts[15, j, k, l]
+        
+      # number of "good" drops (success prob is lower than current reference)
+      #num_good_drops = num_drops - num_suboptimal_drops
+      num_good_drops = counts[17, j, k, l] - counts[20, j, k, l]
+      
+      # total number of "good" actions
+      num_good_actions = num_good_switches + num_good_drops
+      
+      # total number of "bad/suboptimal" actions
+      #num_bad_actions = num_suboptimal_switches + num_suboptimal_drops
+      num_bad_actions = counts[15, j, k, l] + counts[20, j, k, l]
+      
+      # proportion of actions that are "good"
+      counts[23, j, k, l] = round(num_good_actions/num_actions, 3)
+      
+      # proportion of actions that are "bad"
+      counts[24, j, k, l] = round(num_bad_actions/num_actions, 3)
+      
+      
+      # Look at biases in estimates
+      summary %>%
+        mutate(bias = Estimate - True.Value) -> summary
+      
+      assign(
+        paste("plot", outcomeDesign[l], orderNames[k], 
+              modelNames[j],  sep=""),
+        summary %>%
+          group_by(Trial.Number, Intervention.Number) %>%
+          arrange(Trial.Number, Intervention.Number, Interim.Analysis) %>%
+          slice(n()) %>%
+          ungroup() %>%
+        ggplot() +
+        geom_histogram(aes(x = bias), bins = 35, fill = "#666666") +
+        geom_vline(xintercept = 0, color = "black", size = 1) +
+        geom_vline(xintercept = median(summary$bias), color = "#b0aeae", size = 1) +
+        scale_x_continuous(limits = c(-2, 2)) +
+        ylab("Number of estimates") +
+        ggtitle(models[j]) +
+        theme_bw() +
+        theme(panel.border = element_rect(color = "black", fill = NA, size = 0.5))
+        )
+    }
+  }
+}
+
+
+
+for(j in 1:length(models)){
+  for(k in 1:length(orderNames)){
+    for(l in 1:length(outcomeDesign)){
+      # format large numbers for printing to table
+      counts[2, j, k, l] = 
+        prettyNum(counts[2, j, k, l], big.mark = ",", scientific = FALSE)
+      counts[3, j, k, l] = 
+        prettyNum(counts[3, j, k, l], big.mark = ",", scientific = FALSE)
+      counts[8, j, k, l] = paste(counts[8, j, k, l], "%", sep="")
+      counts[10, j, k, l] = paste(counts[10, j, k, l], "%", sep="")
+      counts[16, j, k, l] = paste(counts[16, j, k, l], "%", sep="")
+      counts[21, j, k, l] = paste(counts[21, j, k, l], "%", sep="")
+    }
+  }
+}
+
+  
+  rownames(counts) = c("Number of Trials", 
+                 "Mean Sample Size",
+                 "Median Sample Size",
+                 "Mean # Analyses",
+                 "Median # Analyses",
+                 "# Trials Reach Best Adapt",
+                 "# Trials Identify Best Adapt",
+                 "Identify Best Version",
+                 "# Trials Identify Best OR 2nd Best Adapt",
+                 "Identify Top Two Versions",
+                 "Total # Analyses",
+                 "Total # Superiority Switches",
+                 "# Times Adapts Simultaneously Met Superiority Criteria", 
+                 "# Times Adapt with Lower True Success Prob Chosen",
+                 "# Sub-optimal Switches",
+                 "% Sub-optimal Switches",
+                 "# Futility Drops", 
+                 "# Best Dropped",
+                 "# Futility Ties",
+                 "# Sub-optimal Drops",
+                 "% Sub-optimal Drops",
+                 "Total # Actions",  
+                 "Prob(Good Action)",
+                 "Prob(Bad Action)"
+  )
+  
+```
+
+\newpage  
+  
+## Bias in Estimates: Linear Outcome Design
+
+```{r}  
+kable(cbind("    Increasing Version Effectiveness", "    Random Order of Version Effectiveness"), 
+      booktabs = TRUE, row.names = FALSE, col.names = c("", "")) %>%
+  column_spec(c(1, 2), width = "8cm", bold = TRUE, color = "black", 
+              background = "lightgray")
+```
+
+```{r, fig.height=10, fig.width=8, warning=FALSE}
+grid.arrange(plot1IncreasingEntropy, plot1RandomEntropy, 
+             `plot1IncreasingE&Covars`, `plot1RandomE&Covars`, 
+             plot1IncreasingnoEntropy, plot1RandomnoEntropy, 
+             nrow = 3)
+```  
+
+\newpage
+  
+## Bias in Estimates: Non-linear Outcome Design 
+
+```{r}
+kable(cbind("   Increasing Version Effectiveness", "   Random Order of Version Effectiveness"), 
+      booktabs = TRUE, row.names = FALSE, col.names = c("", "")) %>%
+  column_spec(c(1, 2), width = "8cm", bold = TRUE, color = "black", 
+              background = "lightgray")
+```
+
+
+```{r, fig.height=10, fig.width=8, warning=FALSE}
+
+grid.arrange(plot2IncreasingEntropy, plot2RandomEntropy, 
+             `plot2IncreasingE&Covars`, `plot2RandomE&Covars`, 
+             plot2IncreasingnoEntropy, plot2RandomnoEntropy, 
+             nrow = 3)
+```  
+
+\newpage 
+  
+## Outcome Design 1
+  
+```{r}
+temp = counts[-c(1, 3, 5, 6, 7, 9, 13, 14, 22), , , ] 
+cbind(temp[, 1, 1, 1], temp[, 2, 1, 1], temp[, 3, 1, 1], 
+      temp[, 1, 2, 1], temp[, 2, 2, 1], temp[, 3, 2, 1]) %>%
+  formatC(drop0trailing = TRUE) %>%
+  kable(row.names = TRUE, 
+        col.names = rep(c("EB weights", "EB + Covariates", "Neither"), 2),
+        booktabs = TRUE) %>%
+    column_spec(column = 1, width = "4.7cm") %>%
+    column_spec(column = 2:7, width = "1.7cm") %>%
+    row_spec(row = c(3, 14), bold = TRUE) %>%
+    add_header_above(c(" " = 1, "Increasing Order" = 3, "Random Order" = 3))
+```
+
+&nbsp;
+&nbsp;
+
+## Outcome Design 2
+  
+```{r}
+temp = counts[-c(1, 3, 5, 6, 7, 9, 13, 14, 22), , , ] 
+cbind(temp[, 1, 1, 2], temp[, 2, 1, 2], temp[, 3, 1, 2], 
+      temp[, 1, 2, 2], temp[, 2, 2, 2], temp[, 3, 2, 2]) %>%
+  formatC(drop0trailing = TRUE) %>%
+  kable(row.names = TRUE, 
+        col.names = rep(c("EB weights", "EB + Covariates", "Neither"), 2),
+        booktabs = TRUE) %>%
+    column_spec(column = 1, width = "4.7cm") %>%
+    column_spec(column = 2:7, width = "1.7cm") %>%
+    row_spec(row = c(3, 14), bold = TRUE) %>%
+    add_header_above(c(" " = 1, "Increasing Order" = 3, "Random Order" = 3))
+```
+

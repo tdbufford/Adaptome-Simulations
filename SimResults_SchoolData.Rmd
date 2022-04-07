@@ -1,0 +1,158 @@
+---
+title: "Adaptome Simulation Results Based on School Data"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(kableExtra)
+library(sas7bdat)
+library(janitor)
+```
+
+## Average Treatment Effect
+
+```{r}
+Ns = seq(40, 200, by = 20)
+directory = "C:/School Based Results/"
+identifyBest = matrix(NA, nrow = length(Ns), ncol = 1)
+probGoodAct = matrix(NA, nrow = length(Ns), ncol = 1)
+for(i in 1:length(Ns)) {
+  file = paste("platformTrialSummary_SchoolData_NperI", 
+               Ns[i], "_Arms4_Thresh0.80.2.csv", sep = "")
+  assign(paste("data", Ns[i], sep = ""),
+         read.csv(paste(directory, file, sep = "")))
+  
+  summary = get(paste("data", Ns[i], sep = ""))
+  #calculate mean tx effect for each trial
+  assign(paste("meanTxs", Ns[i], sep = ""), 
+         (summary %>%
+            group_by(Trial.Number, Intervention.Number) %>%
+            arrange(Trial.Number, Intervention.Number, Interim.Analysis) %>%
+            slice(n()) %>%
+            ungroup() %>%
+            group_by(Trial.Number) %>%
+            summarize(Mean.TxEffect = sum(Sample.Size*True.Value)/sum(Sample.Size)) %>%
+            mutate(N = Ns[i]))
+  )
+  
+  assign(paste("EntropyPercent", Ns[i], sep = ""), 
+         (summary %>%
+            group_by(Trial.Number, Interim.Analysis) %>%
+            arrange(Trial.Number, Interim.Analysis) %>%
+            filter(n() > 1) %>%
+            slice(1) %>%
+            ungroup() %>%
+            summarize(NumberAnalyses = round(n()/max(Trial.Number), 1), 
+                      PercentEntropy = 
+                        100 - round(sum(Entropy.Error)/n()*100, 1)) %>%
+            mutate(N = Ns[i]))
+  )
+  
+  #number of trials that identify best adaptation
+  (summary %>%
+        group_by(Trial.Number) %>%
+        filter(Interim.Analysis == max(Interim.Analysis)) %>%
+        filter(True.Value == 11.4 & 
+                 (Reference.Group.Flag == 1 | Superiority.Criteria.Met == 1)) %>%
+        distinct(Trial.Number) %>%
+        ungroup() %>%
+        summarise(n()))[[1]] -> identifyBest[i, 1]
+  
+  # get reference group information for each analysis
+      summary %>% 
+        filter(Reference.Group.Flag == 1) %>%
+        dplyr::select(Trial.Number, Interim.Analysis, Estimate,
+               True.Value) %>%
+        rename("RefGroupEstimate" = Estimate,
+               "RefGroupTrueProb" = True.Value) -> one_row_per_analysis
+      
+      num_analyses = nrow(one_row_per_analysis)
+      # get adaptations that met superiority threshold for each analysis
+      summary %>% 
+        group_by(Trial.Number, Interim.Analysis) %>%
+        filter(Superiority.Criteria.Met == 1) %>%
+        filter(Estimate == max(Estimate)) %>%
+        filter(Intervention.Number == min(Intervention.Number)) %>%
+        ungroup() %>%
+        dplyr::select(Trial.Number, Interim.Analysis, Estimate, 
+               True.Value, Superiority.Prob) %>%
+        rename("NewAdaptEstimate" = Estimate,
+               "NewAdaptTrueProb" = True.Value) %>%
+        right_join(one_row_per_analysis, 
+                   by = c("Trial.Number", "Interim.Analysis")) ->
+        one_row_per_analysis
+      
+      #total number of reference group switches made
+      (one_row_per_analysis %>%
+        filter(!is.na(NewAdaptEstimate)) %>%
+        summarise(n()))[[1]] -> num_switches
+      
+      # number of ref group switches where new ref had lower true success
+      (one_row_per_analysis %>% 
+        filter(NewAdaptTrueProb <= RefGroupTrueProb) %>%
+        summarise(n()))[[1]] -> num_bad_switches
+      
+       # total number of times any adaptation dropped for futility
+      (summary %>%
+        filter(Inferiority.Criteria.Met == 1) %>%
+        summarise(n()))[[1]] -> num_drops
+      
+      # number of times adaptation with higher true success probability than reference
+      # group dropped for futility
+      summary %>% 
+        group_by(Trial.Number, Interim.Analysis) %>%
+        filter(Inferiority.Criteria.Met == 1) %>%
+        ungroup() %>%
+        dplyr::select(Trial.Number, Interim.Analysis, Estimate,
+               True.Value, Superiority.Prob) %>%
+        rename("FutilAdaptEstimate" = Estimate,
+               "FutilAdaptTrueProb" = True.Value) %>%
+        right_join(one_row_per_analysis, 
+                   by = c("Trial.Number", "Interim.Analysis")) -> 
+        one_row_per_drop
+      
+      (one_row_per_drop %>%
+        filter(FutilAdaptTrueProb > RefGroupTrueProb) %>%
+        summarise(n()))[[1]] -> num_bad_drops
+      
+      probGoodAct[i] = 1 - 
+        (num_bad_switches + num_bad_drops)/(num_switches + num_drops)
+
+}
+
+trialTxs = rbind(meanTxs40, meanTxs60, meanTxs80, meanTxs100, meanTxs120, 
+                 meanTxs140, meanTxs160)
+
+trialTxs %>% 
+  mutate(N = as.factor(N)) -> trialTxs
+
+trialTxs %>%
+  ggplot() + 
+  geom_boxplot(aes(x = Mean.TxEffect, y = N)) +
+  xlab("Mean Treatment Effect") + 
+  ylab("N per Interim Analysis") +
+  scale_y_discrete(limits = as.character(seq(40, 160, by = 20))) +
+  coord_flip()
+```
+
+&nbsp;
+
+```{r}
+rbind(EntropyPercent40, EntropyPercent60, EntropyPercent80, 
+      EntropyPercent100, EntropyPercent120, EntropyPercent140,
+      EntropyPercent160) %>%
+  dplyr::select(N, NumberAnalyses, PercentEntropy) %>%
+  mutate(PercentEntropy = paste(PercentEntropy, "%", sep = "")) %>%
+  cbind("best" = identifyBest[1:7,], "goodAct" = probGoodAct[1:7,]) %>%
+  mutate(best = paste(best, "%", sep = ""), 
+         goodAct = round(goodAct, 3)) %>%
+  kable(booktabs = TRUE, align = 'ccc',
+        col.names = c("N per group per analysis", "Avg # of analyses needed", 
+                      "Able to use entropy balancing", "Identify Best Version", 
+                       "Prob(Good Action)")) %>%
+  column_spec(1:5, width = "1in")
+```
+
+
